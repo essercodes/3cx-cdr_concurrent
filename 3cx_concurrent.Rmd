@@ -1,0 +1,260 @@
+---
+title: "3CX CDR Analysis"
+author: "Max Esser"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 8,
+  fig.asp = .618,
+  dpi = 300,
+  fig.align = 'center'
+  )
+
+library(tidyverse)
+library(lubridate)
+
+```
+
+```{r read, cache=TRUE}
+timezone = "America/Chicago"
+
+#cdr <- read_csv("/Volumes/CDRLogs/cdr.log",
+cdr <- read_csv("cdr.log",
+                col_names = c(
+                  'history_id',
+                  'call_id',
+                  'duration',
+                  'time_start',
+                  'time_answered',
+                  'time_end',
+                  'reason_terminated',
+                  'from_number',
+                  'to_number',
+                  'from_dest',
+                  'to_dest',
+                  'dial_number',
+                  'reason_changed',
+                  'final_number',
+                  'final_dest',
+                  'bill_code',
+                  'bill_rate',
+                  'bill_cost',
+                  'bill_name',
+                  'chain'
+                )
+  ) %>% 
+  filter(!is.na(time_answered), 
+         !is.na(duration), 
+         #str_detect(to_number, "Ext."), # only incoming numbers
+         seconds(duration) > 0
+         ) %>%
+  mutate(
+    history_id = str_extract(history_id, "[:digit:]+"),
+    duration = hms(duration),
+    time_start = with_tz(ymd_hms(time_start), timezone),
+    time_answered = with_tz(ymd_hms(time_answered), timezone),
+    time_end = with_tz(ymd_hms(time_end), timezone)
+  )
+```
+
+## Concurrent Calls
+<!-- Break each call into shorter intervals with length of `chunk_size`. -->
+<!-- https://stackoverflow.com/questions/51407177/r-lubridate-split-durations-into-sub-durations -->
+```{r break_up, cache=TRUE}
+chunk_size <- 10
+
+cdr_chunk <- cdr %>%
+  select(call_id, duration, time_start) %>%
+  group_by(call_id) %>%
+  mutate(
+    duration_new = (seconds(duration)) %>% seq(0,.,by=chunk_size) %>% c(seconds(duration)) %>% diff %>% list,
+    time_start_new = list(time_start + seconds(c(0,cumsum(head(duration_new[[1]], -1))))),
+    #time_end_new = list(time_start + seconds(cumsum(duration_new[[1]]))),
+    segment_id = list(seq_along(duration_new[[1]]))
+  ) %>%
+  unnest(cols = c(duration_new, time_start_new, segment_id)) %>%
+  ungroup()
+```
+
+<!-- Summarize number of active calls in any `chunk_size` sized chunk. -->
+```{r count_chunks, cache=TRUE}
+cdr_chunk_count <- cdr_chunk %>%
+  filter(duration_new > (chunk_size/2)) %>%
+  mutate(
+    time_start_new = ceiling_date(time_start_new, str_c(chunk_size, "seconds", sep="")),
+    #time_end_new = ceiling_date(time_end_new, str_c(chunk_size, "seconds", sep="")),
+    year = year(time_start_new),
+    month = month(time_start_new),
+    wday = wday(time_start_new, label = TRUE),
+    mday = mday(time_start_new),
+    hour = hour(time_start_new),
+    minute = minute(time_start_new),
+    second = second(time_start_new)
+  ) %>%
+  group_by(year, month, wday, mday, hour, minute, second) %>%
+  count %>%
+  mutate(
+    time = ymd_hms(str_c(year, month, mday, hour, minute, second, sep="-"))
+  ) %>% 
+  ungroup %>%
+  full_join(    # add missing chunks
+    ., 
+    tibble(
+      time = seq(
+        slice_min(., time)$time, 
+        slice_max(., time)$time, 
+        hms(str_c("00:00:",chunk_size))
+      )
+    )
+  ) %>% 
+  replace_na(list(n=0))
+```
+
+```{r max_concurrent}
+cdr_chunk_count %>%
+  group_by(wday, hour) %>%
+  summarise(
+    n = max(n)
+    ) %>%
+  mutate(
+    date = str_c(wday, "/", hour)
+    ) %>%
+  filter(!is.na(wday)) %>%
+  ggplot(aes(x=hour, y=n)) +
+    geom_smooth(aes(color=wday), alpha=1/2,se = F) +
+    scale_color_brewer(palette="Set1") +
+    xlab(str_c("Hour (", timezone, ")")) +
+    ylab("Concurrent Calls") +
+    ggtitle("Maximim Concurrent Calls") +
+    scale_x_continuous(breaks = seq(0,23,1)) +
+    scale_y_continuous(breaks = seq(0,20,2))
+    
+```
+
+```{r avg_concurrent}
+cdr_chunk_count %>%
+  group_by(wday, hour) %>%
+  summarise(
+    n = mean(n)
+    ) %>%
+  mutate(
+    date = str_c(wday, "/", hour)
+    ) %>%
+  filter(!is.na(wday)) %>%
+  ggplot(aes(x=hour, y=n)) +
+    geom_smooth(aes(color=wday), alpha=1/2, se=F) +
+    scale_color_brewer(palette="Set1") +
+    xlab(str_c("Hour (", timezone, ")")) +
+    ylab("Concurrent Calls") +
+    ggtitle("Average Concurrent Calls") +
+    scale_x_continuous(breaks = seq(0,23,1)) +
+    scale_y_continuous(breaks = seq(0,20,2))
+```
+
+```{r max_avg_concurrent_facet}
+cdr_chunk_count %>%
+  group_by(wday, hour) %>%
+  summarise(
+    max = max(n),
+    mean = mean(n)
+    ) %>%
+  mutate(
+    date = str_c(wday, "/", hour)
+    ) %>%
+  filter(!is.na(wday)) %>%
+  ggplot(aes(x=hour)) +
+    geom_line(aes(y = max), color = 'red') +
+    geom_line(aes(y = mean), color = 'blue') +
+    facet_wrap(~wday) +
+    xlab(str_c("Hour (", timezone, ")")) +
+    ylab("Concurrent Calls") +
+    ggtitle("Max & Mean Concurrent Calls") +
+    scale_x_continuous(breaks = seq(0,23,2)) +
+    scale_y_continuous(breaks = seq(0,20,2))
+```
+
+
+```{r avg_concurrent_facet}
+cdr_chunk_count %>%
+  group_by(wday, hour) %>%
+  summarise(
+    mean = mean(n)
+    ) %>%
+  mutate(
+    date = str_c(wday, "/", hour)
+    ) %>%
+  filter(!is.na(wday)) %>%
+  ggplot(aes(x=hour)) +
+    geom_line(aes(y = mean), color = 'blue') +
+    facet_wrap(~wday) +
+    xlab(str_c("Hour (", timezone, ")")) +
+    ylab("Concurrent Calls") +
+    ggtitle("Average Concurrent Calls") +
+    scale_x_continuous(breaks = seq(0,23,2)) +
+    scale_y_continuous(breaks = seq(0,20,0.25))
+```
+
+### Daily Violin Plots {.tabset .tabset-fade}
+
+```{r day_violin_function}
+day_violin <- function(cdr, day) {
+  cdr %>%
+  filter(
+      !is.na(wday), 
+      wday == day
+    ) %>%
+  ggplot(aes(factor(hour), n)) +
+    geom_violin() +
+    xlab(str_c("Hour (", timezone, ")")) +
+    ylab("Concurrent Calls") +
+    ggtitle(str_c(day, "Concurrent Calls", sep = " ")) +
+    scale_y_continuous(
+      limits = c(1,13),
+      breaks = seq(1,13)
+    )
+}
+```
+
+
+#### Mon
+```{r mon_violin}
+day_violin(cdr_chunk_count, "Mon")
+```
+
+#### Tues
+```{r tue_violin}
+day_violin(cdr_chunk_count, "Tue")
+```
+
+#### Wed
+```{r wed_violin}
+day_violin(cdr_chunk_count, "Wed")
+```
+
+#### Thu
+```{r thu_violin}
+day_violin(cdr_chunk_count, "Thu")
+```
+
+#### Fri
+```{r fri_violin}
+day_violin(cdr_chunk_count, "Fri")
+```
+
+#### Sat
+```{r sat_violin}
+day_violin(cdr_chunk_count, "Sat")
+```
+
+#### Sun
+```{r sun_violin}
+day_violin(cdr_chunk_count, "Sun")
+```
+
+
